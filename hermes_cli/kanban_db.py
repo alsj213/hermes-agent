@@ -3086,6 +3086,16 @@ def _gate_qa_completion(
         return
     if (profile or "") == "qa":
         return
+    # 需求卡/QA 签卡也可能引用 QA-SPEC 行，但它们没有实现；只有实现卡
+    # （有 impl_done，或原始 assignee 仍是 engineer）才需要 qa 收口。
+    # 否则 pm 的需求卡会被误判成实现卡（2026-11-07 端到端实测）。
+    assignee_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    assignee = assignee_row["assignee"] if assignee_row is not None else None
+    impl_payload, _impl_run_id = _latest_event_payload(conn, task_id, "impl_done")
+    if impl_payload is None and (assignee or "") != "engineer":
+        return
     if not force:
         raise QaCompletionError(
             f"{task_id} 有 qa 签署行（QA-SPEC），只有 qa 的 run 能收口："

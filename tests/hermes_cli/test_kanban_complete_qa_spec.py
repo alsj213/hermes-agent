@@ -322,6 +322,14 @@ def test_unsigned_card_completed_by_pm(kanban_home):
     assert "qa_completion_override" not in events
 
 
+def test_signed_requirement_card_can_be_completed_by_pm(kanban_home):
+    """pm 需求卡引用 QA-SPEC 行，但它没有 impl_done，不是实现卡。"""
+    tid = _create(assignee="pm")
+    with kbc.connect_closing() as conn:
+        assert kb.complete_task(conn, tid, result="done", acting_profile="pm") is True
+    assert _state(tid)[0]["status"] == "done"
+
+
 def test_unsigned_card_completed_without_any_identity(kanban_home):
     tid = _create(body=UNSIGNED_BODY, assignee="pm")
     with kbc.connect_closing() as conn:
