@@ -79,6 +79,21 @@ def _seed_tier(tid, *, tier="B", head="a" * 40, profile="pm"):
         tid, {"tier": tier, "reason": "常规改动", "head_sha": head}, profile=profile)
 
 
+def _seed_impl_done(tid, *, head="a" * 40):
+    """tier 闸门只在有 impl_done 的实现卡上生效；测试先补这一条。"""
+    now = int(time.time())
+    with kbc.connect_closing() as conn:
+        with kb.write_txn(conn):
+            cur = conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, 'engineer', 'done', ?, ?, 'completed')",
+                (tid, now, now),
+            )
+            kb._append_event(conn, tid, "impl_done",
+                             {"pr": 1, "head_sha": head}, run_id=cur.lastrowid)
+
+
 def _state(tid):
     """``(task 行, 事件 kind 列表)`` —— 用来断言「零变更」。"""
     with kbc.connect_closing() as conn:
@@ -180,6 +195,7 @@ def test_qa_run_from_claim_completes(kanban_home):
 
 def test_qa_complete_without_tier_is_refused(kanban_home):
     tid = _create()
+    _seed_impl_done(tid)
     before, before_events = _state(tid)
     with kbc.connect_closing() as conn:
         with pytest.raises(kb.QaTierMissingError) as ei:
@@ -193,6 +209,7 @@ def test_qa_complete_without_tier_is_refused(kanban_home):
 
 def test_qa_complete_with_tier_missing_reason_is_refused(kanban_home):
     tid = _create()
+    _seed_impl_done(tid)
     _seed_tier_payload(tid, {"tier": "B", "head_sha": "a" * 40})
     with kbc.connect_closing() as conn:
         with pytest.raises(kb.QaTierMissingError) as ei:
@@ -203,6 +220,7 @@ def test_qa_complete_with_tier_missing_reason_is_refused(kanban_home):
 
 def test_qa_complete_with_illegal_tier_is_refused(kanban_home):
     tid = _create()
+    _seed_impl_done(tid)
     _seed_tier_payload(tid, {"tier": "D", "reason": "x", "head_sha": "a" * 40})
     with kbc.connect_closing() as conn:
         with pytest.raises(kb.QaTierMissingError) as ei:
@@ -212,6 +230,7 @@ def test_qa_complete_with_illegal_tier_is_refused(kanban_home):
 
 def test_qa_complete_with_tier_from_non_pm_is_refused(kanban_home):
     tid = _create()
+    _seed_impl_done(tid)
     _seed_tier(tid, profile="engineer")
     with kbc.connect_closing() as conn:
         with pytest.raises(kb.QaTierMissingError) as ei:
@@ -221,11 +240,20 @@ def test_qa_complete_with_tier_from_non_pm_is_refused(kanban_home):
 
 def test_qa_complete_with_tier_bad_head_is_refused(kanban_home):
     tid = _create()
+    _seed_impl_done(tid)
     _seed_tier(tid, head="not-a-sha")
     with kbc.connect_closing() as conn:
         with pytest.raises(kb.QaTierMissingError) as ei:
             kb.complete_task(conn, tid, result="PASS", acting_profile="qa")
     assert "head_sha 形态非法" in str(ei.value)
+
+
+def test_qa_spec_sign_card_without_impl_done_is_not_tier_gated(kanban_home):
+    """QA 的「签署验收标准」卡也含 QA-SPEC，但它没有 impl_done、没有 tier。"""
+    tid = _create(assignee="qa")
+    with kbc.connect_closing() as conn:
+        assert kb.complete_task(conn, tid, result="signed", acting_profile="qa") is True
+    assert _state(tid)[0]["status"] == "done"
 
 
 def test_e1_flow_refused_then_fixed_by_pm_tier(kanban_home):

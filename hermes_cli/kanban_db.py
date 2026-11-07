@@ -527,15 +527,22 @@ def _latest_event_payload(conn, task_id, kind):
 
 
 def _gate_qa_tier(conn, task_id, *, acting_profile=None):
-    """QA-SPEC 卡在 qa 收口前必须有合法的 pm tier 证据。
+    """有 ``impl_done`` 的 QA-SPEC 卡，qa 收口前必须有合法的 pm tier 证据。
 
     只拦 qa 的收口路径：非 qa 的 complete 先由 ``_gate_qa_completion`` 处理，
     ``force=True`` 是那条闸门的显式逃逸口；本闸门不再二次改变 force 的语义。
+
+    **必须带 impl_done 才生效**：qa 的「签署验收标准」卡正文也含 ``QA-SPEC: qa``，
+    但它没有实现、也没有 tier；按 body 判会把签卡误拦（2026-11-07 端到端实测）。
+    实现卡在交 qa 前由 pre-review 闸门强制写过 impl_done，所以这条判据不会漏。
     """
     profile, _run_id, body = _qa_completion_actor(conn, task_id, acting_profile)
     if _QA_SPEC_SIGN_RE.search(body) is None:
         return
     if (profile or "") != "qa":
+        return
+    impl_payload, _impl_run_id = _latest_event_payload(conn, task_id, "impl_done")
+    if impl_payload is None:
         return
     payload, tier_run_id = _latest_event_payload(conn, task_id, "tier")
     if payload is None:
