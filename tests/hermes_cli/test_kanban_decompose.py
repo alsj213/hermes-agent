@@ -85,7 +85,9 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "rationale": "test split",
         "tasks": [
             {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {"title": "build", "body": "PATH-CLAIM: src/a.py\nTEST-PLAN: quick\n"
+             "CONSUMER: python -m pytest\ncode it\n\n## 验收标准\nQA-SPEC: qa",
+             "assignee": "engineer", "parents": [0]},
         ],
     })
 
@@ -164,7 +166,9 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
     fills in when no explicit default is set (explicit config → card
     assignee → active profile)."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True)
+        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True,
+                             body="PATH-CLAIM: src/a.py\nTEST-PLAN: quick\n"
+                             "CONSUMER: python -m pytest\nship it\n\n## 验收标准\nQA-SPEC: qa")
 
     llm_payload = jsonlib.dumps({
         "fanout": True,

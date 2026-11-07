@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -455,6 +456,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         )
         # Ready-lane task with the same fresh PR comment.
         ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        _mark_task_ran(conn, ready_id)
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
 
         assert kbd.check_respawn_guard(conn, ready_id) == "active_pr"
@@ -493,6 +495,22 @@ def _backdate_comments(conn, tid, seconds=60):
         )
 
 
+def _mark_task_ran(conn, tid, profile="worker"):
+    """active_pr only guards a card that actually ran (dispatch #111910).
+
+    Use a crashed run, not a completed one: ``recent_success`` is checked
+    before ``active_pr`` and would mask the guard this test is about.
+    """
+    now = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, ?, 'crashed', 'crashed', ?, ?)",
+            (tid, profile, now, now),
+        )
+
+
 def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -515,8 +533,10 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
 
     with kbc.connect() as conn:
         dev_id = kb.create_task(conn, title="dev own pr", assignee="dev")
+        _mark_task_ran(conn, dev_id, profile="dev")
         kb.add_comment(conn, dev_id, author="dev", body=pr_comment)
         closer_id = kb.create_task(conn, title="closer recovery", assignee="dev")
+        _mark_task_ran(conn, closer_id, profile="dev")
         kb.add_comment(conn, closer_id, author="dev", body=pr_comment)
         _backdate_comments(conn, closer_id)
         assert kb.assign_task(conn, closer_id, "closer") is True
@@ -553,6 +573,7 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
     pr_comment = "Opened https://github.com/example/repo/pull/44 for review."
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="same assign", assignee="dev")
+        _mark_task_ran(conn, tid, profile="dev")
         kb.add_comment(conn, tid, author="dev", body=pr_comment)
         _backdate_comments(conn, tid)
         assert kb.assign_task(conn, tid, "dev") is True
@@ -928,3 +949,105 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+# ---------------------------------------------------------------------------
+# Hard gate: devteam engineer handoff must carry an impl_done from THIS run
+# ---------------------------------------------------------------------------
+
+QA_BODY = (
+    "PATH-CLAIM: src/a.py\nTEST-PLAN: quick\nCONSUMER: python -m pytest\n\n"
+    "## 验收标准\nQA-SPEC: qa\n"
+)
+
+
+def _engineer_task(conn, body: str = QA_BODY):
+    tid = kb.create_task(conn, title="impl", body=body, assignee="engineer")
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    assert run_id is not None
+    return tid, run_id
+
+
+def test_request_review_rejects_missing_impl_done(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid, run_id = _engineer_task(conn)
+        ok, reason = kb.request_review(
+            conn, tid, expected_run_id=run_id, with_reason=True
+        )
+        assert ok is False
+        assert "缺 impl_done" in reason
+        assert _row(conn, tid)["status"] == "running"
+
+
+def test_request_review_rejects_stale_impl_done(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid, run_id = _engineer_task(conn)
+        kb._append_event(
+            conn, tid, "impl_done",
+            {"pr": 1, "head_sha": "a" * 40}, run_id=run_id - 1,
+        )
+        ok, reason = kb.request_review(
+            conn, tid, expected_run_id=run_id, with_reason=True
+        )
+        assert ok is False
+        assert "impl_done 绑 run" in reason
+        assert _row(conn, tid)["status"] == "running"
+
+
+def test_request_review_accepts_current_run_impl_done(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid, run_id = _engineer_task(conn)
+        kb._append_event(
+            conn, tid, "impl_done",
+            {"pr": 1, "head_sha": "a" * 40}, run_id=run_id,
+        )
+        ok = kb.request_review(conn, tid, expected_run_id=run_id)
+        assert ok is True
+        assert _row(conn, tid)["status"] == "review"
+
+
+def test_request_review_rejects_rework_over_budget(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid, run_id = _engineer_task(conn)
+        for _ in range(2):
+            kb._append_event(conn, tid, "changes_requested", {"reason": "x"})
+        kb._append_event(
+            conn, tid, "impl_done",
+            {"pr": 1, "head_sha": "a" * 40}, run_id=run_id,
+        )
+        ok, reason = kb.request_review(
+            conn, tid, expected_run_id=run_id, with_reason=True
+        )
+        assert ok is False
+        assert "changes_requested=2" in reason
+
+
+def test_request_review_gate_force_and_operator_bypass(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid, run_id = _engineer_task(conn)
+        # force=True is the explicit operator override.
+        assert kb.request_review(conn, tid, expected_run_id=run_id, force=True) is True
+        assert _row(conn, tid)["status"] == "review"
+
+
+def test_request_review_gate_skips_qa_handoff(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="qa", body=QA_BODY, assignee="qa")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.request_review(conn, tid, expected_run_id=run_id) is True
+
+
+def test_request_review_gate_ignores_malformed_latest_impl_done(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect() as conn:
+        tid, run_id = _engineer_task(conn)
+        kb._append_event(conn, tid, "impl_done", {"pr": 1, "head_sha": "a" * 40}, run_id=run_id)
+        kb._append_event(conn, tid, "impl_done", {"pr": 2}, run_id=run_id)
+        ok, reason = kb.request_review(
+            conn, tid, expected_run_id=run_id, with_reason=True
+        )
+        assert ok is False
+        assert "缺 pr/head_sha" in reason

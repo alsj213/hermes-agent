@@ -331,6 +331,360 @@ _CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
 
+# 卡正文硬上限（镜像 src/team_board/bodylimit.py:BODY_LIMIT_BYTES，勿单方面改）
+_MAX_TASK_BODY_BYTES = 2048
+
+
+class BodyTooLargeError(ValueError):
+    """卡正文超过 _MAX_TASK_BODY_BYTES（UTF-8 字节）。"""
+
+
+def _validate_task_body(body):
+    if body is None:
+        return
+    n = len(str(body).encode("utf-8"))
+    if n > _MAX_TASK_BODY_BYTES:
+        raise BodyTooLargeError(
+            f"body 超过硬上限：{n} 字节（UTF-8），上限 {_MAX_TASK_BODY_BYTES} 字节；"
+            "长背景/证据请放附件或卡评论，卡正文只写差异部分。")
+
+
+# 合并类卡建卡闸门（R17 机器闸门）。谓词镜像 src/team_board/prclaim.py:TRIGGER_RE，勿单方面改。
+_PR_CLAIM_TRIGGER_RE = re.compile(r"^(?:合并卡|收口卡|合并\s*PR\s*#\s*\d+|收口[：:（(])")
+# MULTILINE：建卡闸门只看首行（靠 .match(first)），worker 自救的写入要认正文任意一行的认领行。
+_PR_CLAIM_LINE_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$", re.MULTILINE)
+_PR_CLAIM_MAX = 999_999_999
+_PR_ARG_RE = re.compile(r"^[1-9][0-9]*$")
+
+
+class PrClaimMissingError(ValueError):
+    """合并类卡正文首行缺 PR-CLAIM 行 → 建卡即拒（CLI rc2 / 工具 tool_error）。"""
+
+
+# 合并类卡建卡闸门（R15 机器闸门）。标题谓词复用 _PR_CLAIM_TRIGGER_RE，不另写正则。
+_MERGE_CARD_ASSIGNEE = "repo"
+
+
+class MergeAssigneeError(ValueError):
+    """合并类卡 assignee 不是 repo → 建卡即拒（CLI rc2 / 工具 tool_error）。"""
+
+
+def _validate_merge_assignee(title, assignee):
+    m = _PR_CLAIM_TRIGGER_RE.search(str(title or ""))
+    if m is None:
+        return
+    got = "" if assignee is None else str(assignee)
+    if got == _MERGE_CARD_ASSIGNEE:
+        return
+    raise MergeAssigneeError(
+        "合并类卡建卡闸门拦下：标题命中合并语义「" + m.group(0)
+        + "」，assignee 必须是 repo（收到「" + (got or "空") + "」）；合并权归 repo bot（R15）。")
+
+
+# 验收标准闸门（qa 预先签署）。必填范围唯一定义处：扩面只改这个元组。
+_QA_SPEC_HEADING = "## 验收标准"
+_QA_SPEC_REQUIRED_ASSIGNEES = ("engineer",)
+_QA_SPEC_SIGN_RE = re.compile(r"^QA-SPEC: qa$", re.MULTILINE)
+
+
+class QaSpecMissingError(ValueError):
+    """实现卡正文缺「## 验收标准」段或缺 qa 签署行 → 建卡即拒（CLI rc2 / 工具 tool_error）。"""
+
+
+class QaCompletionError(ValueError):
+    """带 qa 签署行的卡被非 qa 的 run 收口 → 拒绝，且不做任何状态变更。"""
+
+
+def _qa_spec_first_line(body):
+    """返回「## 验收标准」段内第一条非空行（原样，不裁尾空白）；没有该段 → None。
+
+    段界 = 下一个 `## ` 或文末。签署行要求「整行匹配」，尾空格必须留下让
+    ``fullmatch`` 判红（``QA-SPEC: qa `` 不算签署行）。
+    """
+    lines = str(body or "").splitlines()
+    for i, line in enumerate(lines):
+        if line.rstrip() == _QA_SPEC_HEADING:
+            for nxt in lines[i + 1:]:
+                if nxt.startswith("## "):
+                    return ""
+                if nxt.strip():
+                    return nxt
+            return ""
+    return None
+
+
+def _validate_qa_spec(body, assignee):
+    got = "" if assignee is None else str(assignee)
+    if got not in _QA_SPEC_REQUIRED_ASSIGNEES:
+        return
+    first = _qa_spec_first_line(body)
+    if first is None:
+        raise QaSpecMissingError(
+            "建卡闸门拦下：assignee=engineer 的实现卡正文必须有「## 验收标准」段"
+            "（验收标准由 qa 预先签署），当前缺该段。")
+    if _QA_SPEC_SIGN_RE.fullmatch(first) is None:
+        raise QaSpecMissingError(
+            "建卡闸门拦下：「## 验收标准」段内第一行必须是「QA-SPEC: qa」"
+            "（qa 签署行，顶格整行），当前是「" + first[:40] + "」。")
+
+
+# 实现卡契约闸门（PATH-CLAIM / TEST-PLAN / CONSUMER）。与 team-board
+# src/team_board/flow.py::audit_card 同口径；card-audit 仍保留为存量卡兜底，
+# 但新建卡必须在落库前过这里，避免「先落库 → audit block → 再建替代卡」的重复卡。
+_IMPL_CONTRACT_ASSIGNEES = ("engineer",)
+_IMPL_PATH_CLAIM_RE = re.compile(r"^PATH-CLAIM:[ \t]*(.*?)[ \t]*\r?$", re.MULTILINE)
+_IMPL_TEST_PLAN_RE = re.compile(
+    r"^TEST-PLAN:[ \t]*(quick|full)[ \t]*\r?$", re.MULTILINE | re.IGNORECASE)
+_IMPL_TEST_PLAN_LINE_RE = re.compile(
+    r"^TEST-PLAN:[ \t]*(.*?)[ \t]*\r?$", re.MULTILINE)
+_IMPL_CONSUMER_RE = re.compile(r"^CONSUMER:[ \t]*(\S.*?)[ \t]*\r?$", re.MULTILINE)
+_IMPL_BAD_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f\\]")
+_IMPL_AUTO_ACTION_SUFFIX = "（自动收口卡）"
+#: 同标题实现卡的重复建卡窗口；窗口内未结的卡视为「正在走流程的那张」。
+_DUP_TASK_WINDOW_SECONDS = 30 * 60
+
+
+class CardContractError(ValueError):
+    """engineer 实现卡缺顶格 PATH-CLAIM / TEST-PLAN / CONSUMER → 建卡即拒。"""
+
+
+class DuplicateTaskError(ValueError):
+    """同标题的实现卡仍未结，又建一张替代卡 → 拒绝（改原卡，或先归档）。"""
+
+
+def _validate_impl_contract(body, assignee, title=""):
+    """engineer 实现卡的机器可读契约：三条顶格行，建卡时一次判完。
+
+    ``PATH-CLAIM`` 允许重复行/逗号分隔；``TEST-PLAN`` 只认 ``quick`` / ``full``；
+    ``CONSUMER`` 必须非空。合并卡（assignee=repo）与自动收口动作卡不在此列。
+    """
+    got = "" if assignee is None else str(assignee)
+    if got not in _IMPL_CONTRACT_ASSIGNEES:
+        return
+    if str(title or "").endswith(_IMPL_AUTO_ACTION_SUFFIX):
+        return
+    text = str(body or "")
+    claims = [m.group(1).strip() for m in _IMPL_PATH_CLAIM_RE.finditer(text)]
+    if not claims:
+        raise CardContractError(
+            "建卡闸门拦下：assignee=engineer 的实现卡缺顶格「PATH-CLAIM: <path>[, <path>]」"
+            "（注意不能写成「- PATH-CLAIM: …」列表项）。")
+    for claim in claims:
+        for raw in claim.split(","):
+            path = raw.strip()
+            if not path:
+                raise CardContractError(
+                    "建卡闸门拦下：PATH-CLAIM 含空路径（逗号两侧都要有路径）。")
+            if path.startswith("/") or path.startswith("~"):
+                raise CardContractError(
+                    f"建卡闸门拦下：PATH-CLAIM 不允许绝对路径或 ~ 路径：{path!r}。")
+            if ".." in path.split("/"):
+                raise CardContractError(
+                    f"建卡闸门拦下：PATH-CLAIM 不允许 .. 段：{path!r}。")
+            if path in {".", "./"} or _IMPL_BAD_PATH_CHARS.search(path):
+                raise CardContractError(
+                    f"建卡闸门拦下：PATH-CLAIM 路径非法：{path!r}。")
+    if _IMPL_TEST_PLAN_RE.search(text) is None:
+        raw = _IMPL_TEST_PLAN_LINE_RE.search(text)
+        actual = f"（当前是「TEST-PLAN: {raw.group(1)}」）" if raw else ""
+        raise CardContractError(
+            "建卡闸门拦下：assignee=engineer 的实现卡缺顶格「TEST-PLAN: quick|full」"
+            "（只能写 quick 或 full）" + actual + "。")
+    if _IMPL_CONSUMER_RE.search(text) is None:
+        raise CardContractError(
+            "建卡闸门拦下：assignee=engineer 的实现卡缺顶格「CONSUMER: <下游会执行的命令>」。")
+
+
+# QA 收口的 tier 前置：与 team-board evidence 契约同口径（kind=tier，
+# payload 三键 tier/reason/head_sha，角色只允许 pm）。内容是否绑当前 head/patch
+# 仍由 merge_guard 的 judge 负责；这里只保证「关单时档位证据已经存在且合法」，
+# 不会因为 rebase 前写入的 tier 在关单时被误杀。
+_EVIDENCE_TIER_REQUIRED_KEYS = ("tier", "reason", "head_sha")
+_EVIDENCE_TIERS = frozenset({"A", "B", "C"})
+_EVIDENCE_REASON_MAX = 200
+_EVIDENCE_HEAD_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$", re.ASCII)
+
+
+class QaTierMissingError(QaCompletionError):
+    """QA-SPEC 卡关单时缺 pm 的 tier 证据 / 证据不合法 → 拒绝，且零状态变更。"""
+
+
+def _latest_event_payload(conn, task_id, kind):
+    """(payload dict | None, run_id | None)；payload 不是 JSON 对象也算无效。"""
+    row = conn.execute(
+        "SELECT payload, run_id FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if row is None:
+        return None, None
+    raw = row["payload"]
+    try:
+        payload = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        payload = None
+    return (payload if isinstance(payload, dict) else None), row["run_id"]
+
+
+def _gate_qa_tier(conn, task_id, *, acting_profile=None):
+    """QA-SPEC 卡在 qa 收口前必须有合法的 pm tier 证据。
+
+    只拦 qa 的收口路径：非 qa 的 complete 先由 ``_gate_qa_completion`` 处理，
+    ``force=True`` 是那条闸门的显式逃逸口；本闸门不再二次改变 force 的语义。
+    """
+    profile, _run_id, body = _qa_completion_actor(conn, task_id, acting_profile)
+    if _QA_SPEC_SIGN_RE.search(body) is None:
+        return
+    if (profile or "") != "qa":
+        return
+    payload, tier_run_id = _latest_event_payload(conn, task_id, "tier")
+    if payload is None:
+        raise QaTierMissingError(
+            f"{task_id} 缺 pm 的 tier 证据（四槽之一），qa 不能直接收口。"
+            "先 request_review(reviewer=\"pm\") 让 pm 写 R7 档位，再回到 qa 收口。")
+    absent = [key for key in _EVIDENCE_TIER_REQUIRED_KEYS if key not in payload]
+    if absent:
+        raise QaTierMissingError(
+            f"{task_id} 的 tier 证据缺键 {'/'.join(absent)}"
+            f"（必须三键齐：{'/'.join(_EVIDENCE_TIER_REQUIRED_KEYS)}），qa 不能收口。")
+    if payload.get("tier") not in _EVIDENCE_TIERS:
+        raise QaTierMissingError(
+            f"{task_id} 的 tier 证据档位非法：{payload.get('tier')!r}"
+            f"（只能是 {'/'.join(sorted(_EVIDENCE_TIERS))}），qa 不能收口。")
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > _EVIDENCE_REASON_MAX:
+        raise QaTierMissingError(
+            f"{task_id} 的 tier 证据 reason 非法（必须是非空字符串且 ≤{_EVIDENCE_REASON_MAX} 字符）。")
+    if not isinstance(payload.get("head_sha"), str) or _EVIDENCE_HEAD_RE.fullmatch(
+            payload["head_sha"]) is None:
+        raise QaTierMissingError(
+            f"{task_id} 的 tier 证据 head_sha 形态非法（应为 40/64 位小写十六进制）。")
+    tier_profile = None
+    if tier_run_id is not None:
+        row = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (tier_run_id,)).fetchone()
+        tier_profile = row["profile"] if row is not None else None
+    if tier_profile != "pm":
+        raise QaTierMissingError(
+            f"{task_id} 的 tier 证据不是 pm 的 run 写的（profile={tier_profile!r}）；"
+            "tier 只能由 pm 在卡上 emit。")
+
+
+# 卡正文固定段落闸门（模板固定段落由 dispatcher 注入，不许写进卡正文）。
+# FIXED_HEADINGS / FIXED_HEADING_RE 镜像本仓 src/team_board/cardtemplate.py 的同名常量，
+# 勿单方面改：tests/unit/test_cardtemplate_kernel.py 逐字比对 .pattern 与条目顺序，
+# 任一侧单独改名 / 换序 / 另写字面量正则都会红。
+FIXED_HEADINGS = (
+    "完成契约",
+    "验收三段式",
+    "验收三段",
+    "边界默认值",
+    "R6 三条",
+    "交付方式",
+    "长内容去哪",
+)
+FIXED_HEADING_RE = re.compile(
+    r"^##\s*(?:" + "|".join(map(re.escape, FIXED_HEADINGS)) + r")\s*$", re.MULTILINE)
+
+# 模板引用行的准确写法（镜像 cardtemplate.template_ref_line()，勿单方面改）
+_CARD_TEMPLATE_REF = "TEMPLATE: card-template.md#v3"
+
+# 模板文件：``$HERMES_CARD_TEMPLATE``（绝对路径）优先，否则
+# ``<kanban_home>/templates/card-template.md``（``scripts/install-card-template.sh``
+# 的落点）。常量与锚点写法镜像本仓 ``src/team_board/cardtemplate.py``。
+_CARD_TEMPLATE_RELPATH = "templates/card-template.md"
+_CTX_MAX_TEMPLATE_BYTES = 4096   # fixed block cap (bytes, not chars)
+TEMPLATE_REF_RE = re.compile(
+    r"^TEMPLATE:\s*card-template\.md#(v\d+)\s*$", re.MULTILINE)
+_TEMPLATE_BEGIN_RE = re.compile(r"<!--\s*FIXED:(v\d+):BEGIN\s*-->")
+
+
+class CardTemplateError(ValueError):
+    """卡正文含模板固定段落标题 → 建卡即拒（CLI rc2 / 工具 tool_error）。"""
+
+
+def _validate_card_template(body):
+    """固定段落标题是模板的一部分，卡正文里出现 = 抄了模板 → 建卡即拒。
+
+    判据只看**顶格整行** ``## <标题>``（``###`` / 行内 / 标题带后缀都不算）。
+    不校验五段是否齐全（会误杀 chief 需求卡与 ops 巡检卡）。
+    """
+    if body is None:
+        return
+    hits: list[str] = []
+    for match in FIXED_HEADING_RE.finditer(str(body)):
+        title = match.group(0).strip().lstrip("#").strip()
+        if title not in hits:
+            hits.append(title)
+    if not hits:
+        return
+    raise CardTemplateError(
+        "建卡闸门拦下：正文含模板固定段落标题「" + "」「".join(hits)
+        + "」（固定段落由 dispatcher 注入，卡正文只写差异部分）；"
+        "请删掉这些标题，正文首行改为 " + _CARD_TEMPLATE_REF + "。")
+
+
+def parse_pr_arg(raw) -> int:
+    """``--pr`` 的取值域：1–999999999 的 ASCII 十进制正整数。
+
+    只认 ASCII 数字（``^[1-9][0-9]*$``）：``0`` / ``1_0`` / ``+1`` / `` 99`` /
+    ``1793160000000`` 一律 ``ValueError``（CLI 映射 rc2），不做 int() 的宽容解析。
+    """
+    text = "" if raw is None else str(raw)
+    if not _PR_ARG_RE.match(text):
+        raise ValueError(
+            f"--pr 必须是 1-{_PR_CLAIM_MAX} 的 ASCII 十进制正整数（收到 {text!r}）")
+    value = int(text)
+    if value > _PR_CLAIM_MAX:
+        raise ValueError(f"--pr 超出上限：最多 {_PR_CLAIM_MAX}（收到 {value}）")
+    return value
+
+
+def set_pr_claim(conn: sqlite3.Connection, task_id: str, pr, *, by: str) -> str:
+    """只动卡正文的 ``PR-CLAIM: #<n>`` 那一行：无则前插，同号幂等，异号冲突。
+
+    返回 ``"inserted"`` / ``"unchanged"``；``done`` / ``archived`` / 无此卡 /
+    异号 / 前插后超 2048B 一律 ``ValueError``（CLI rc2）。正文其余字节逐字保留，
+    ``title`` / ``status`` / ``assignee`` / ``priority`` 一律不动。
+    """
+    value = int(pr)
+    line = f"PR-CLAIM: #{value}"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT body, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"no such task: {task_id}")
+        status = row["status"]
+        if status in ("done", "archived"):
+            raise ValueError(f"cannot set PR-CLAIM on {task_id}: status={status}")
+        body = row["body"] or ""
+        existing = _PR_CLAIM_LINE_RE.search(body)
+        if existing is not None:
+            current = int(existing.group(1))
+            if current == value:
+                return "unchanged"
+            raise ValueError(
+                f"PR-CLAIM 冲突：{task_id} 已认领 #{current}，拒绝改成 #{value}")
+        new_body = f"{line}\n{body}" if body else line
+        _validate_task_body(new_body)
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (new_body, task_id))
+        _append_event(conn, task_id, "edited",
+                      {"fields": ["body"], "pr_claim": value, "by": by})
+    return "inserted"
+
+
+def _validate_pr_claim(title, body):
+    m = _PR_CLAIM_TRIGGER_RE.search(str(title or ""))
+    if m is None:
+        return
+    first = next((ln.strip() for ln in str(body or "").splitlines() if ln.strip()), "")
+    if _PR_CLAIM_LINE_RE.match(first):
+        return
+    raise PrClaimMissingError(
+        "PR-CLAIM 闸门拦下建卡：标题命中合并语义「" + m.group(0)
+        + "」，正文首行必须是「PR-CLAIM: #<PR号>」，当前首行是「" + first[:40] + "」。")
+
+
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
     """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
@@ -1218,6 +1572,12 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    _validate_task_body(body)
+    _validate_pr_claim(title, body)
+    _validate_merge_assignee(title, assignee)
+    _validate_qa_spec(body, assignee)
+    _validate_impl_contract(body, assignee, title)
+    _validate_card_template(body)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
@@ -1257,6 +1617,32 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    # 同标题 + 同 parent 的实现卡仍未结时，拒绝再建一张「替代卡」：E1b
+    # 实测过 PM 被 card-audit 拦下后新建重复卡，正确动作是改原卡（或先归档）。
+    # 同位 parent 是必要条件：返工卡通常挂在被判卡下，不能被误判成重复。
+    if assignee == "engineer":
+        cutoff = int(time.time()) - _DUP_TASK_WINDOW_SECONDS
+        candidates = conn.execute(
+            "SELECT id, status FROM tasks "
+            " WHERE assignee = ? AND title = ? "
+            "   AND status NOT IN ('done', 'archived') AND created_at >= ? "
+            " ORDER BY created_at DESC",
+            (assignee, title.strip(), cutoff),
+        ).fetchall()
+        wanted_parents = set(parents)
+        for dup in candidates:
+            linked = {
+                row["parent_id"] for row in conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ?", (dup["id"],)
+                ).fetchall()
+            }
+            if linked != wanted_parents:
+                continue
+            raise DuplicateTaskError(
+                f"建卡闸门拦下：同标题、同 parent 的实现卡 {dup['id']} 仍未结"
+                f"（status={dup['status']}），不要新建替代卡；请改原卡"
+                "（被 card-audit 拦时按提示修原卡），确需新建先归档原卡。")
 
     now = int(time.time())
 
@@ -2655,11 +3041,67 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _qa_completion_actor(
+    conn: sqlite3.Connection, task_id: str, acting_profile: Optional[str],
+) -> tuple[Optional[str], Optional[int], str]:
+    """``(profile, run_id, body)`` for the qa-signature completion gate.
+
+    ``acting_profile`` wins when the caller names it; otherwise the profile comes
+    from ``tasks.current_run_id`` → ``task_runs.profile`` (no active run → None).
+    """
+    row = conn.execute(
+        "SELECT body, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return acting_profile, None, ""
+    run_id = row["current_run_id"]
+    profile = acting_profile
+    if profile is None and run_id:
+        r = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        profile = r["profile"] if r is not None else None
+    return profile, run_id, row["body"] or ""
+
+
+def _gate_qa_completion(
+    conn: sqlite3.Connection, task_id: str, *, acting_profile: Optional[str] = None,
+    force: bool = False, now: Optional[int] = None,
+) -> None:
+    """qa 签署卡（正文整行 ``QA-SPEC: qa``）只许 qa 的 run 收口。
+
+    Runs before the completion write txn: a refusal leaves the card, its run and
+    the event log untouched. ``force=True`` is the only escape hatch and it is
+    never silent — it records a ``qa_completion_override`` audit event.
+    """
+    profile, run_id, body = _qa_completion_actor(conn, task_id, acting_profile)
+    if _QA_SPEC_SIGN_RE.search(body) is None:
+        return
+    if (profile or "") == "qa":
+        return
+    if not force:
+        raise QaCompletionError(
+            f"{task_id} 有 qa 签署行（QA-SPEC），只有 qa 的 run 能收口："
+            f"当前 profile={profile or '无 active run'}（run={run_id or '无'}）。"
+            "改走 kanban_request_changes / kanban_request_review(reviewer=\"qa\") / kanban_comment。")
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "qa_completion_override",
+            {
+                "profile": profile,
+                "run_id": run_id,
+                "at": int(now if now is not None else time.time()),
+            },
+        )
+    return
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    acting_profile: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2677,11 +3119,23 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    A card whose body carries the qa signature line (``QA-SPEC: qa``) may only be
+    closed by a ``qa`` run: :class:`QaCompletionError` before the write txn
+    otherwise. ``acting_profile`` names the closing identity; ``None`` falls back
+    to the profile of the card's current run (no active run → refused).
+    ``force=True`` is the only escape hatch and records a
+    ``qa_completion_override`` audit event.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # qa 签署卡只许 qa 的 run 收口；判在写事务之前，拒绝时零变更。
+    _gate_qa_completion(conn, task_id, acting_profile=acting_profile, force=force, now=now)
+    # qa 收口前必须有 pm 的 tier 证据（四槽之一）；否则 merge card 会在更晚的
+    # evidence 闸门被 blocked（E1 实测），把问题前移到关单这一步。
+    _gate_qa_tier(conn, task_id, acting_profile=acting_profile)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -3278,6 +3732,63 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _pre_review_contract_guard(
+    conn: sqlite3.Connection, task_id: str, current_run_id: Optional[int]
+) -> Optional[str]:
+    """devteam 实现卡交 QA 前的硬闸门：impl_done 必须由**当前 run**重发。
+
+    只在 ``expected_run_id`` 给出（worker 路径）且卡面有 ``QA-SPEC: qa`` 时生效，
+    且只拦 engineer 的 handoff —— qa→pm 的 tier 交接不要求重发 impl_done。
+    返回拒绝原因，``None`` 表示放行。判定与 ``team-board handoff-check`` 同口径：
+    缺 impl_done / impl_done 绑旧 run / changes_requested 超预算 1。
+    """
+
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    body = "" if row is None or row[0] is None else str(row[0])
+    if "QA-SPEC: qa" not in body:
+        return None
+    if current_run_id is None:
+        return "devteam 实现卡没有 current_run_id；无法确认 impl_done 属于本 run"
+    run = conn.execute(
+        "SELECT profile FROM task_runs WHERE id = ?", (int(current_run_id),)
+    ).fetchone()
+    if run is None or str(run[0]) != "engineer":
+        return None
+    rows = conn.execute(
+        "SELECT kind, payload, run_id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('impl_done', 'changes_requested') "
+        "ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    latest_impl: Optional[tuple[dict, Optional[int]]] = None
+    rework = 0
+    for kind, payload, run_id in rows:
+        if kind == "changes_requested":
+            rework += 1
+            continue
+        try:
+            data = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            return "impl_done payload 不是合法 JSON；拒绝交 QA"
+        # The most recent impl_done wins even when malformed: falling back to
+        # an older valid event would hand QA a stale head behind a fresh one.
+        latest_impl = (data if isinstance(data, dict) else {}, run_id)
+    if latest_impl is None:
+        return "缺 impl_done（pr + head_sha）；先在当前 engineer run 内 emit"
+    if not latest_impl[0].get("pr") or not latest_impl[0].get("head_sha"):
+        return "最新 impl_done 缺 pr/head_sha；拒绝交 QA"
+    if latest_impl[1] != current_run_id:
+        return (
+            f"impl_done 绑 run {latest_impl[1]}，当前 run 是 {current_run_id}；"
+            "在新 head 上重发 impl_done 后再交 QA（handoff-check 硬闸门）"
+        )
+    if rework > 1:
+        return (
+            f"changes_requested={rework} 超过预算 1；停手交 ops/老板，不再自动返工"
+        )
+    return None
+
+
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
@@ -3333,6 +3844,12 @@ def request_review(
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
+            if expected_run_id is not None and not force:
+                contract_reason = _pre_review_contract_guard(
+                    conn, task_id, trow["current_run_id"]
+                )
+                if contract_reason:
+                    return _ret(False, contract_reason)
             if reviewer is None:
                 reviewer = _prior_reviewer(conn, task_id)
                 if reviewer is False:
@@ -3429,13 +3946,30 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    cause: Optional[str] = None, cause_quote: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    ``cause`` / ``cause_quote`` carry the rework attribution (2026-10-29):
+    ``cause`` must be one of impl / spec / env, and ``cause_quote`` must be a
+    verbatim substring of ``reason`` so the attribution cannot be invented
+    after the fact. Both stay optional for backward compatibility.
+    """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+
+    cause = _nonblank_str(cause)
+    cause_quote = _nonblank_str(cause_quote)
+    if cause is not None or cause_quote is not None:
+        if cause not in ("impl", "spec", "env"):
+            return False, "cause must be one of impl / spec / env"
+        if cause_quote is None:
+            return False, "cause_quote is required when cause is set"
+        if cause_quote not in reason:
+            return False, "cause_quote must be a verbatim substring of reason"
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -3491,6 +4025,8 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "cause": cause,
+                "cause_quote": cause_quote,
             },
             run_id=run_id,
         )
@@ -3618,6 +4154,79 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             ),
         )
         return True
+
+
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    to_status: str = "review",
+    assignee: Optional[str] = None,
+    reason: str,
+    actor: str = "operator",
+) -> bool:
+    """``done``/``blocked`` -> ``review`` / ``todo`` / ``ready``（人工恢复口）。
+
+    E1 实测：qa 在 pm 写 tier 前直接 complete，修复时要重开 done 卡，但当时没有
+    CLI，只能直接改 SQLite。这里提供受审计的恢复动作：
+    - 只接受 ``done`` / ``blocked``，且卡上没有 active run；
+    - 写 ``reopened`` 事件（from/to/assignee/reason/actor），保留 run 与事件历史；
+    - 清掉 ``result`` / ``completed_at`` / block 计数，避免重开后仍显示旧结论；
+    - **不**替代 ``unblock_task`` 的依赖重算，也不删除 ``completed`` 事件。
+    """
+    if to_status not in ("review", "todo", "ready"):
+        raise ValueError("to_status must be one of review/todo/ready")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("reopen requires a non-empty reason")
+    actor = str(actor or "operator").strip() or "operator"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] not in ("done", "blocked"):
+            return False
+        if row["current_run_id"] is not None:
+            return False
+        sets = [
+            "status = ?",
+            "completed_at = NULL",
+            "result = NULL",
+            "current_run_id = NULL",
+            "claim_lock = NULL",
+            "claim_expires = NULL",
+            "worker_pid = NULL",
+            "worker_started_at = NULL",
+            "block_kind = NULL",
+            "block_recurrences = 0",
+            "consecutive_failures = 0",
+            "last_failure_error = NULL",
+        ]
+        params: list[Any] = [to_status]
+        if assignee is not None:
+            sets.append("assignee = ?")
+            params.append(_canonical_assignee(assignee))
+        params.append(task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET " + ", ".join(sets)
+            + " WHERE id = ? AND status IN ('done', 'blocked') AND current_run_id IS NULL",
+            tuple(params),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "reopened",
+            {
+                "from_status": row["status"],
+                "to_status": to_status,
+                "assignee": assignee,
+                "reason": reason,
+                "actor": actor,
+            },
+        )
+    return True
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3927,6 +4536,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    _ctx_template(lines, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -3995,6 +4605,70 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append("## Body")
         lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+
+def _card_template_path() -> Path:
+    """``$HERMES_CARD_TEMPLATE``（绝对路径）优先，否则 ``<kanban_home>/templates/card-template.md``。
+
+    两条都没有时返回默认路径 —— 由调用方按「文件缺失」fail-soft。
+    """
+    override = os.environ.get("HERMES_CARD_TEMPLATE", "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file():
+            return candidate
+    return kanban_home() / _CARD_TEMPLATE_RELPATH
+
+
+def _template_hint(lines: list[str], reason: str) -> None:
+    """fail-soft 提示行：不注入固定段落，只多这一行（既有段一律不动）。"""
+    lines.append(f"_template: {reason}；按 docs/card-template.md 写正文")
+    lines.append("")
+
+
+def _ctx_template(lines: list[str], task: Task) -> None:
+    """把卡的 ``TEMPLATE: card-template.md#v3`` 引用指向的固定段落注入上下文。
+
+    解析顺序：``$HERMES_CARD_TEMPLATE`` → ``<kanban_home>/templates/card-template.md``。
+    版本号取自卡正文的引用行（``TEMPLATE_REF_RE``），固定段落取文件里
+    ``<!-- FIXED:<ver>:BEGIN -->`` 与 ``<!-- FIXED:<ver>:END -->`` 之间的全文。
+
+    fail-soft（不抛异常、不改既有段，只多一行 ``_template: <原因>``）：
+    无 TEMPLATE 行 / 文件缺失或读不了 / 锚点缺 / 版本不符。
+    超 ``_CTX_MAX_TEMPLATE_BYTES`` 字节按字节截断并标 ``… [truncated]``。
+    """
+    body = task.body or ""
+    match = TEMPLATE_REF_RE.search(body)
+    if not match:
+        _template_hint(lines, "卡正文没有 " + _CARD_TEMPLATE_REF + " 引用行")
+        return
+    version = match.group(1)
+    path = _card_template_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        _template_hint(lines, f"模板文件缺失或读不了：{path}")
+        return
+    begin = f"<!-- FIXED:{version}:BEGIN -->"
+    end = f"<!-- FIXED:{version}:END -->"
+    start = text.find(begin)
+    stop = text.find(end, start + len(begin)) if start >= 0 else -1
+    if start < 0 or stop < 0:
+        found = sorted({m.group(1) for m in _TEMPLATE_BEGIN_RE.finditer(text)})
+        if found and version not in found:
+            _template_hint(
+                lines, f"模板版本不符：卡要 {version}，{path.name} 只有 {'/'.join(found)}")
+        else:
+            _template_hint(lines, f"模板缺 {begin} / {end} 锚点")
+        return
+    block = text[start + len(begin):stop].strip("\n")
+    raw = block.encode("utf-8")
+    if len(raw) > _CTX_MAX_TEMPLATE_BYTES:
+        block = raw[:_CTX_MAX_TEMPLATE_BYTES].decode("utf-8", "ignore").rstrip()
+        block += "… [truncated]"
+    lines.append(f"## Template (card-template.md#{version})")
+    lines.append(block)
+    lines.append("")
 
 
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:

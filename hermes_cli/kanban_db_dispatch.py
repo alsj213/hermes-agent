@@ -1643,6 +1643,18 @@ def check_respawn_guard(
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
+        # A card that has never run cannot have spawned the worker that opened
+        # that PR. This matters for merge/closing cards created by the reviewer:
+        # their body/comment names the PR they must merge, and the guard used to
+        # park them in `ready` forever (observed: t_b78582d0 sat 65 minutes with
+        # zero runs, and t_385db65f 8 hours, both merge cards). Guards exist to
+        # avoid a duplicate worker on a PR someone already opened — with no run
+        # there is nobody to duplicate.
+        ever_ran = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,),
+        ).fetchone()
+        if ever_ran is None:
+            return None
         return "active_pr"
 
     return None

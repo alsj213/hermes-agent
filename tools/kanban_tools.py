@@ -21,7 +21,8 @@ from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
-    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA,
+    KANBAN_CLAIM_PR_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
@@ -659,9 +660,48 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 # --- Handlers ---
 
+# 2026-10-30 PAIMENG-PATCH-SHOW-COMPACT: kanban_show 按 Cursor「文件即上下文」口径收窄。
+# 实测一张卡的 show 会吐 94KB（worker_context 43KB + 评论 25KB + 事件 13.6KB），
+# 单次调用就把 4.3 万 token 灌进 worker 上下文。现在只回能改变下一步动作的最小集合，
+# 完整正文落盘给路径，按需 read_file/grep 分页取。
+_SHOW_BODY_CHARS = 2048
+_SHOW_WORKER_CTX_CHARS = 1500
+_SHOW_COMMENTS_KEEP = 3
+_SHOW_COMMENT_CHARS = 400
+_SHOW_EVENTS_KEEP = 10
+_SHOW_RUN_SUMMARY_CHARS = 300
+_SHOW_MAX_BYTES = 20_000
+
+
+def _show_cap(text: Any, limit: int) -> str:
+    """截断成 head + 显式省略标记（与 build_worker_context 的口径一致）。"""
+    s = (text or "").strip() if isinstance(text, str) else ""
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _show_spill(full: dict[str, Any], board: str, tid: str) -> str:
+    """把完整正文写到 scratch，返回绝对路径（失败不抛，返回空串）。"""
+    try:
+        import pathlib
+        import tempfile
+        base = os.environ.get("HERMES_SCRATCH_DIR") or os.environ.get("TMPDIR") or tempfile.gettempdir()
+        d = pathlib.Path(base) / "kanban-show"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{(board or 'default')}-{tid}.json"
+        p.write_text(json.dumps(full, ensure_ascii=False, indent=1), encoding="utf-8")
+        return str(p)
+    except Exception:
+        logger.debug("kanban_show spill failed", exc_info=True)
+        return ""
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Compact task state: row, parents, children, recent comments, runs, last events.
+
+    完整正文（全部评论、事件 payload、worker_context）落盘，路径见 full_detail_path。"""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
@@ -676,20 +716,58 @@ def _handle_show(args: dict, **kw) -> str:
         })
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        comments = kb.list_comments(conn, tid)
+        events = kb.list_events(conn, tid)
+        runs = kb.list_runs(conn, tid)
+        worker_ctx = kb.build_worker_context(conn, tid)
+        task_fields = _fields(task, _TASK_FIELDS)
+        task_fields["body"] = _show_cap(task_fields.get("body"), _SHOW_BODY_CHARS)
+        full = {
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
-            # Non-terminal parents; on a running card this means the dependency
-            # gate is not holding it and kanban_complete will refuse.
             "unsatisfied_parents": [
                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
-            # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "comments": [_fields(c, _COMMENT_FIELDS) for c in comments],
+            "events": [_fields(e, _EVENT_FIELDS) for e in events],
+            "runs": [_fields(r, _RUN_FIELDS) for r in runs],
+            "worker_context": worker_ctx,
+        }
+        kept = comments[-_SHOW_COMMENTS_KEEP:]
+        payload: dict[str, Any] = {
+            "task": task_fields,
+            "parents": kb.parent_ids(conn, tid),
+            # Non-terminal parents; on a running card this means the dependency
+            # gate is not holding it and kanban_complete will refuse.
+            "unsatisfied_parents": full["unsatisfied_parents"],
+            "children": kb.child_ids(conn, tid),
+            "comments": [
+                {**_fields(c, ("author", "created_at")), "body": _show_cap(c.body, _SHOW_COMMENT_CHARS)}
+                for c in kept],
+            "comments_total": len(comments),
+            "comments_omitted": max(0, len(comments) - len(kept)),
+            # payload（spawn/claim/attach 等事件体）只落盘，不进口径：它对下一步动作无影响。
+            "events": [_fields(e, ("kind", "created_at", "run_id")) for e in events[-_SHOW_EVENTS_KEEP:]],
+            "events_total": len(events),
+            "runs": [
+                {**_fields(r, ("id", "profile", "status", "outcome", "started_at", "ended_at")),
+                 "summary": _show_cap(r.summary, _SHOW_RUN_SUMMARY_CHARS),
+                 "error": _show_cap(r.error, _SHOW_RUN_SUMMARY_CHARS)}
+                for r in runs],
+            # 完整 worker_context 在 spawn 时已经给过该 worker；这里只留开头做校对，不重复灌。
+            "worker_context_head": _show_cap(worker_ctx, _SHOW_WORKER_CTX_CHARS),
+            "worker_context_chars": len(worker_ctx),
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+        if len(text.encode("utf-8")) > _SHOW_MAX_BYTES or len(worker_ctx) > _SHOW_WORKER_CTX_CHARS:
+            path = _show_spill(full, args.get("board") or "", tid)
+            if path:
+                payload["full_detail_path"] = path
+                payload["full_detail_hint"] = (
+                    "完整正文（全部评论、事件 payload、worker_context 全文）已落盘。"
+                    "需要细节时用 read_file 分页或 search_files 局部取，不要整文件读进上下文。")
+                text = json.dumps(payload, ensure_ascii=False)
+        return text
 
 
 @_kanban_handler("kanban_list")
@@ -761,6 +839,21 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"Your task is still in-flight and its scratch workspace was kept. Fix the "
                 f"artifact path or storage error, then retry kanban_complete with the same "
                 f"handoff.")
+        except kb.QaTierMissingError as tier_err:
+            # tier 是 merge card 四槽之一；在 qa 关单前就拒，避免卡 done 之后
+            # merge card 才 blocked（E1 实测）。给 qa 一条可执行出路。
+            return tool_error(
+                f"kanban_complete refused: {tier_err} 卡未变更，你的 run 仍在跑。"
+                "请先 kanban_request_review(reviewer=\"pm\") 让 pm 写 R7 tier，"
+                "等 pm 交回后再 kanban_complete。")
+        except kb.QaCompletionError as qa_err:
+            # qa 签署卡只许 qa 的 run 收口。闸门在写事务之前跑：卡未变更、本 run
+            # 仍开着 —— 点名三条出路，否则模型会把 tool_error 当终态直接卡死。
+            return tool_error(
+                f"kanban_complete refused: {qa_err} 卡未变更，你的 run 仍在跑。"
+                "请改走 kanban_request_changes（把活退回实现者）、"
+                "kanban_request_review(reviewer=\"qa\")（把卡交给 qa 收口）、"
+                "或 kanban_comment（只留言）；这三条是唯一出路。")
         except kb.LiveClaimError as claim_err:
             # Env-less caller (orchestrator, another session) on a card a dispatcher
             # worker is executing: refusing here is what keeps that worker's run open.
@@ -924,7 +1017,8 @@ def _handle_request_changes(args: dict, **kw) -> str:
         _require_text(args, "reason", "reason is required — describe the changes needed"))
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
+            cause=args.get("cause"), cause_quote=args.get("cause_quote"))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 
@@ -971,6 +1065,28 @@ def _handle_comment(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
+
+
+@_kanban_handler("kanban_claim_pr")
+def _handle_claim_pr(args: dict, **kw) -> str:
+    """只给卡正文写 ``PR-CLAIM: #<n>``；own-task only，其它字段只读。
+
+    真 worker shell 里 ``hermes kanban claim --pr`` 被 delegate 围栏挡死（rc1），
+    工具层不带那个 marker，所以补写走这一条：``_worker_guard`` 仍校验 own-task
+    归属，写入本身由 ``kb.set_pr_claim`` 负责（前插 / 同号幂等 / 异号冲突 /
+    done 拒绝 / 2048B 溢出，正文其余字节逐字保留）。
+    """
+    tid = _worker_guard("kanban_claim_pr", args)
+    with _board(args.get("board")) as (kb, conn):
+        try:
+            pr = kb.parse_pr_arg(args.get("pr"))
+            outcome = kb.set_pr_claim(conn, tid, pr, by=_persisted_identity())
+            if outcome == "inserted":
+                kb.add_comment(conn, tid, author=_persisted_identity(),
+                               body=f"PR-CLAIM 由 {_persisted_identity()} 补写（kanban_claim_pr）")
+        except ValueError as exc:
+            raise _Reject(f"kanban_claim_pr: {exc}")
+        return _ok(task_id=tid, outcome=outcome, pr=pr)
 
 
 def _store_attachment(board, tid, filename, data, content_type) -> str:
@@ -1302,6 +1418,7 @@ _TOOLS = (
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),
+    ("kanban_claim_pr", KANBAN_CLAIM_PR_SCHEMA, _handle_claim_pr, "🔖"),
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),

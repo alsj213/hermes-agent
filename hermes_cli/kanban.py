@@ -210,7 +210,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "reopen",
     "gc",
 })
 
@@ -360,25 +360,30 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
-    with kbc.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
-            project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            completion_contract=getattr(args, "completion_contract", None),
-            initial_status=getattr(args, "initial_status", "running"),
-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                             if is_dispatcher_owned_worker_context() else None),
-        )
-        task = kb.get_task(conn, task_id)
+    try:
+        with kbc.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn, title=args.title, body=body, assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries, model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                completion_contract=getattr(args, "completion_contract", None),
+                initial_status=getattr(args, "initial_status", "running"),
+                creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                 if is_dispatcher_owned_worker_context() else None),
+            )
+            task = kb.get_task(conn, task_id)
+    except (kb.BodyTooLargeError, kb.PrClaimMissingError, kb.MergeAssigneeError,
+            kb.QaSpecMissingError, kb.CardContractError, kb.DuplicateTaskError,
+            kb.CardTemplateError) as exc:
+        return _err(f"kanban: {exc}", 2)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
@@ -733,6 +738,9 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    raw_pr = getattr(args, "pr", None)
+    if raw_pr is not None:
+        return _cmd_pr_claim(args, raw_pr)
     with kbc.connect_closing() as conn:
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
@@ -744,6 +752,37 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         workspace = kbw.resolve_workspace(task)
         kbw.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
+    return 0
+
+
+def _cmd_pr_claim(args: argparse.Namespace, raw_pr: str) -> int:
+    """``claim <id> --pr <n>``：只给卡正文补 ``PR-CLAIM: #<n>``，不认领任务。
+
+    worker 只能改 ``HERMES_KANBAN_TASK`` 指定的自己那张（越界 rc1，沿用
+    ``_worker_run_id_for`` 的既有文案）；``--pr`` 越界 / ``done``·``archived`` /
+    异号冲突一律 rc2。补写成功后留一行 comment 作痕迹。
+    """
+    try:
+        _worker_run_id_for(args.task_id)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}")
+    try:
+        pr = kb.parse_pr_arg(raw_pr)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    author = _profile_author()
+    try:
+        with kbc.connect_closing() as conn:
+            outcome = kb.set_pr_claim(conn, args.task_id, pr, by=author)
+            if outcome == "inserted":
+                kb.add_comment(conn, args.task_id, author,
+                               f"PR-CLAIM 由 {author} 补写（hermes kanban claim）")
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    if outcome == "unchanged":
+        print(f"PR-CLAIM 已是 #{pr}（未改动）")
+    else:
+        print(f"已为 {args.task_id} 写入 PR-CLAIM: #{pr}")
     return 0
 
 
@@ -908,8 +947,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if rc:
         return rc
     fail_msg: dict[str, str] = {}
+    qa_rejected = False
     with kbc.connect_closing() as conn:
         def op(tid):
+            nonlocal qa_rejected
             gate_err = _goal_gate_error(
                 conn, tid, (summary or args.result or "").strip(), "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
@@ -922,6 +963,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
                                         force=bool(getattr(args, "force", False)))
+            except kb.QaCompletionError as qa_err:
+                # qa 签署卡只许 qa 的 run 收口：rc2、stderr 恰一行、零 traceback。
+                qa_rejected = True
+                fail_msg[tid] = f"kanban: {qa_err}"
+                return False
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -941,7 +987,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
             return done
 
-        return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+        rc = _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+    return 2 if qa_rejected else rc
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
@@ -1060,10 +1107,36 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kbc.connect_closing() as conn:
-        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
+        ok, detail = kb.request_changes(
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+            cause=getattr(args, "cause", None),
+            cause_quote=getattr(args, "cause_quote", None),
+        )
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
+    return 0
+
+
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    """``done``/``blocked`` -> review/todo/ready，供 ops/paimeng 做受审计恢复。"""
+    reason = " ".join(args.reason).strip() if args.reason else ""
+    if not reason:
+        return _err("kanban reopen: --reason is required", 2)
+    author = _profile_author()
+    with kbc.connect_closing() as conn:
+        if not kb.reopen_task(
+            conn, args.task_id, to_status=args.to, assignee=args.assignee,
+            reason=reason, actor=author,
+        ):
+            return _err(
+                f"cannot reopen {args.task_id}: only done/blocked cards with no "
+                "active run can be reopened", 1)
+        kb.add_comment(
+            conn, args.task_id, author=author,
+            body=f"REOPENED to {args.to}: {reason}",
+        )
+    print(f"Reopened {args.task_id} to {args.to}")
     return 0
 
 
@@ -1329,7 +1402,8 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review, "reopen": _cmd_reopen,
+    "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

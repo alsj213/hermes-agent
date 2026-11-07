@@ -41,7 +41,9 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
 
     children = [
         {"title": "research", "body": "look at prior art", "assignee": "researcher", "parents": []},
-        {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
+        {"title": "build it", "body": "PATH-CLAIM: src/a.py\nTEST-PLAN: quick\n"
+         "CONSUMER: python -m pytest\nwrite code\n\n## 验收标准\nQA-SPEC: qa",
+         "assignee": "engineer", "parents": [0]},
     ]
     with kbc.connect() as conn:
         child_ids = decompose_triage_task(

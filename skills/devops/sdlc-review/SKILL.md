@@ -54,6 +54,47 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
 
+## Evidence obligation（devteam 板）
+
+本机 devteam 板的合并闸门要求实现卡四槽 evidence：`tier` / `qa_pass` / `review:defect` /
+`review:regression`。**必须在本次 review run 内写**；run 结束后无法补写，卡 done 后也无法
+再补。qa 评审在 approve 前执行（`TB` 是 team-board CLI）：
+
+```bash
+TB='PYTHONPATH=/home/liu/project/team-board/src /home/liu/project/team-board/.venv/bin/python -m team_board.cli'
+HEAD=$(git -C "$HERMES_KANBAN_WORKSPACE" rev-parse HEAD)
+PATCH=$($TB evidence patch --repo "$HERMES_KANBAN_WORKSPACE" --base origin/main --head "$HEAD")
+$TB evidence emit --kind qa_pass --head "$HEAD" --patch "$PATCH" \
+  --run-id "$HERMES_KANBAN_RUN_ID" --card "$HERMES_KANBAN_TASK"
+$TB evidence emit --kind review --disc defect --verdict pass --head "$HEAD" --patch "$PATCH" \
+  --run-id "$HERMES_KANBAN_RUN_ID" --card "$HERMES_KANBAN_TASK"
+$TB evidence emit --kind review --disc regression --verdict pass --head "$HEAD" --patch "$PATCH" \
+  --run-id "$HERMES_KANBAN_RUN_ID" --card "$HERMES_KANBAN_TASK"
+```
+
+- 判 request changes 时，把对应 review 的 `--verdict` 改成 `block`，不要写 `qa_pass`。
+- pm 评审只能写 `tier` + 两条 review；`qa_pass` 必须由 qa 的 run 写。
+- 写不出证据（找不到 patch / CLI 失败）→ `kanban_block`，不要 `kanban_complete`。
+
+**双问还必须贴到 PR 页面**（`merge_guard` 的 reviewhead 闸门读 PR 正文，不读看板事件）：
+
+```bash
+PR=$(gh pr list --head "wt/$HERMES_KANBAN_TASK" --json number --jq '.[0].number')
+gh pr comment "$PR" -R alsj213/team-board --body "REVIEW-PATCH: $PATCH
+REVIEW-KIND: defect
+REVIEW-VERDICT: pass
+
+<缺陷视角结论与证据>"
+gh pr comment "$PR" -R alsj213/team-board --body "REVIEW-PATCH: $PATCH
+REVIEW-KIND: regression
+REVIEW-VERDICT: pass
+
+<回归视角结论与证据>"
+```
+
+`gh` 不可用 / 贴不上去 → `kanban_block`，不要 `kanban_complete`；没有这两条，merge_guard
+的「双问绑定」闸门必拒。
+
 ## Review Lenses
 
 Vary how you look at the work on each round instead of repeating the same inspection. Decorrelated lenses catch different defect classes: a cold read of the artifact surfaces design and correctness problems that the implementer's narrative would have framed away, execution surfaces claims that do not reproduce, and a strict contract audit surfaces quiet scope drift. Repeating the round-1 lens on round 3 mostly re-finds what round 1 already found.
@@ -118,6 +159,13 @@ kanban_complete(
 ```
 
 Include the exact checks that passed and any bounded caveat that does not block acceptance.
+
+**devteam exception:** after writing `qa_pass` + both `review` slots and posting the two PR
+markers, if `tier` evidence is not yet present, call `kanban_request_review(reviewer="pm")`
+**for the tier slot only**; pm writes `tier` and hands the card back. qa then completes it.
+Do not ask pm to review the code again or to create a merge card. If `tier=C` and
+`boss_approve` is missing, request `paimeng` (or block) before completing. Merge cards are
+created by the `team-board merge-card --sweep` timer after the implementation card is done.
 
 #### Request changes
 

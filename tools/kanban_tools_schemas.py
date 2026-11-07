@@ -290,6 +290,21 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "cause": {
+            "type": "string",
+            "enum": ["impl", "spec", "env"],
+            "description": (
+                "Rework attribution (required by R14 from 2026-10-29): impl = the "
+                "implementation is wrong; spec = the card spec/acceptance was wrong "
+                "(counts against who wrote the card); env = environment/CI fault "
+                "(counts against nobody). Omit only when you cannot tell."
+            ),
+        },
+        "cause_quote": _prop("string", (
+                "Verbatim quote from your review text that proves the attribution. "
+                "Must be a literal substring of `reason`; the write is rejected "
+                "otherwise, so the attribution cannot be invented after the fact."
+        )),
     },
     ["reason"],
 )
@@ -330,6 +345,28 @@ KANBAN_COMMENT_SCHEMA = _schema(
         "body": _prop("string", "Markdown-supported comment body."),
     },
     ["task_id", "body"],
+)
+
+KANBAN_CLAIM_PR_SCHEMA = _schema(
+    "kanban_claim_pr",
+    (
+        "Repair your own card's ``PR-CLAIM: #<n>`` line after you opened a "
+        "PR. Only that one line changes: it is prepended when absent, the "
+        "rest of the body is preserved byte-for-byte, a same-number claim is "
+        "idempotent and a different one is a conflict. A dispatcher-spawned "
+        "worker can only write its own task. This does not claim the run and "
+        "does not change status, title, assignee or any other field — use "
+        "kanban_complete / kanban_request_review for lifecycle."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "pr": _prop("string", (
+            "PR number: an ASCII decimal integer from 1 to 999999999. "
+            "``0``, ``+1``, ``1_0``, ``00099``, ``99 `` and 13-digit "
+            "timestamps are rejected."
+        )),
+    },
+    ["pr"],
 )
 
 KANBAN_ATTACH_SCHEMA = _schema(

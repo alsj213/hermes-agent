@@ -276,7 +276,10 @@ _SPECS = [
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
-    ], help="Atomically claim a ready task (prints resolved workspace path)"),
+        _arg("--pr", metavar="<n>",
+             help="PR 号（1-999999999 的 ASCII 十进制正整数）：把 PR-CLAIM: #<n> 写到卡正文首行"),
+    ], help="Atomically claim a ready task (prints resolved workspace path); "
+            "with --pr, only write PR-CLAIM to the task body (worker: own task only)"),
     _cmd("comment", [
         _TASK_ID,
         _arg("text", nargs="+", help="Comment body"),
@@ -338,15 +341,30 @@ _SPECS = [
         _arg("--reviewer", help="Optional reviewer profile; reassigns the task before review dispatch."),
         _arg("--metadata", help="JSON object with structured reviewer handoff facts."),
         _arg("--force", action="store_true",
-             help="Override the live-claim guard: move a running, claimed "
-                  "task to review even without owning its run (clears the worker's claim)."),
+             help="Override the live-claim guard and the devteam handoff gate: "
+                  "move a running, claimed task to review even without owning its run "
+                  "(clears the worker's claim; skips impl_done/rework prechecks)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
-         help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("request-changes", [
+        _TASK_ID,
+        _arg("reason", nargs="+", help="Concrete changes required before re-review"),
+        _arg("--cause", choices=["impl", "spec", "env"],
+             help="Rework attribution: impl (implementation wrong) / spec (card spec wrong) / env (environment)."),
+        _arg("--cause-quote", dest="cause_quote",
+             help="Verbatim quote from the review text proving the attribution; must be a substring of REASON."),
+    ], help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+    _cmd("reopen", [
+        _TASK_ID,
+        _arg("--to", choices=["review", "todo", "ready"], default="review",
+             help="Target status (default: review)"),
+        _arg("--assignee", help="Optional owner to hand the reopened card to"),
+        _arg("--reason", nargs="+", required=True,
+             help="Audit reason (recorded on task_events and as a comment)"),
+    ], help="Reopen a done/blocked card for recovery (audited)"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
