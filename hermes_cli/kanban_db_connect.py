@@ -887,6 +887,8 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Structural card type; legacy rows are backfilled once below.
+    ("kind", "kind TEXT NOT NULL DEFAULT 'requirement'"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -941,7 +943,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn.execute(copy_sql)
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
-            _add_column_if_missing(conn, "tasks", name, ddl)
+            added = _add_column_if_missing(conn, "tasks", name, ddl)
+            if added and name == "kind":
+                # One-time legacy backfill. New cards set kind explicitly
+                # (create_task infers by role when omitted); this migration is
+                # the only place that looks at historical evidence/title.
+                conn.execute(
+                    "UPDATE tasks SET kind = CASE "
+                    " WHEN EXISTS (SELECT 1 FROM task_events e "
+                    "              WHERE e.task_id = tasks.id AND e.kind = 'impl_done') "
+                    "   THEN 'implementation' "
+                    " WHEN assignee = 'engineer' THEN 'implementation' "
+                    " WHEN assignee = 'repo' THEN 'merge' "
+                    " WHEN assignee = 'qa' THEN 'spec_sign' "
+                    " ELSE 'requirement' END"
+                )
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,

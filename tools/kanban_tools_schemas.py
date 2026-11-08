@@ -452,6 +452,16 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "links. The assigned worker reads this as part of "
                 "its context."
         )),
+        "kind": {
+            "type": "string",
+            "enum": ["implementation", "spec_sign", "requirement", "merge", "action"],
+            "description": (
+                "Structural card type. Kernel admission/completion gates key on "
+                "this field, not on body prose. Defaults by assignee: engineer → "
+                "implementation, qa → spec_sign, repo → merge, everyone else → "
+                "requirement."
+            ),
+        },
         "parents": {
             "type": "array",
             "items": {"type": "string"},

@@ -381,7 +381,40 @@ def _validate_merge_assignee(title, assignee):
         + "」，assignee 必须是 repo（收到「" + (got or "空") + "」）；合并权归 repo bot（R15）。")
 
 
-# 验收标准闸门（qa 预先签署）。必填范围唯一定义处：扩面只改这个元组。
+# 卡的显式类型。内核只按这个字段决定建卡/收口闸门，不再用正文猜卡类型
+# （2026-11-08 E2E：QA 签卡/PM 需求卡都引用 QA-SPEC 行，正文启发式误拦两次）。
+VALID_TASK_KINDS = ("implementation", "spec_sign", "requirement", "merge", "action")
+
+
+def _infer_task_kind(assignee: Optional[str]) -> str:
+    """未显式给 kind 时的角色默认值；这是结构化默认，不读正文。
+
+    engineer 的实现卡、qa 的签署/验证卡、repo 的合并卡各有默认；
+    其余（chief/pm/ops/hatch/user）都是 requirement。调用方仍可显式覆盖。
+    """
+    got = "" if assignee is None else str(assignee)
+    if got == "engineer":
+        return "implementation"
+    if got == "qa":
+        return "spec_sign"
+    if got == "repo":
+        return "merge"
+    return "requirement"
+
+
+def _normalize_task_kind(kind: Optional[str], assignee: Optional[str]) -> str:
+    if kind is None:
+        return _infer_task_kind(assignee)
+    got = str(kind).strip().lower()
+    if got not in VALID_TASK_KINDS:
+        raise ValueError(
+            f"kind must be one of {VALID_TASK_KINDS}, got {kind!r}"
+        )
+    return got
+
+
+# 验收标准闸门（qa 预先签署）。_QA_SPEC_REQUIRED_ASSIGNEES 只保留给旧调用方做
+# 兜底；内核 create_task 一律传 kind，不要再扩这个元组。
 _QA_SPEC_HEADING = "## 验收标准"
 _QA_SPEC_REQUIRED_ASSIGNEES = ("engineer",)
 _QA_SPEC_SIGN_RE = re.compile(r"^QA-SPEC: qa$", re.MULTILINE)
@@ -413,14 +446,17 @@ def _qa_spec_first_line(body):
     return None
 
 
-def _validate_qa_spec(body, assignee):
-    got = "" if assignee is None else str(assignee)
-    if got not in _QA_SPEC_REQUIRED_ASSIGNEES:
+def _validate_qa_spec(body, assignee=None, *, kind=None):
+    if kind is not None:
+        required = kind == "implementation"
+    else:
+        required = ("" if assignee is None else str(assignee)) in _QA_SPEC_REQUIRED_ASSIGNEES
+    if not required:
         return
     first = _qa_spec_first_line(body)
     if first is None:
         raise QaSpecMissingError(
-            "建卡闸门拦下：assignee=engineer 的实现卡正文必须有「## 验收标准」段"
+            "建卡闸门拦下：kind=implementation 的实现卡正文必须有「## 验收标准」段"
             "（验收标准由 qa 预先签署），当前缺该段。")
     if _QA_SPEC_SIGN_RE.fullmatch(first) is None:
         raise QaSpecMissingError(
@@ -452,14 +488,17 @@ class DuplicateTaskError(ValueError):
     """同标题的实现卡仍未结，又建一张替代卡 → 拒绝（改原卡，或先归档）。"""
 
 
-def _validate_impl_contract(body, assignee, title=""):
-    """engineer 实现卡的机器可读契约：三条顶格行，建卡时一次判完。
+def _validate_impl_contract(body, assignee=None, title="", *, kind=None):
+    """implementation 卡的机器可读契约：三条顶格行，建卡时一次判完。
 
     ``PATH-CLAIM`` 允许重复行/逗号分隔；``TEST-PLAN`` 只认 ``quick`` / ``full``；
-    ``CONSUMER`` 必须非空。合并卡（assignee=repo）与自动收口动作卡不在此列。
+    ``CONSUMER`` 必须非空。合并卡（kind=merge）与自动收口动作卡不在此列。
     """
-    got = "" if assignee is None else str(assignee)
-    if got not in _IMPL_CONTRACT_ASSIGNEES:
+    if kind is not None:
+        required = kind == "implementation"
+    else:
+        required = ("" if assignee is None else str(assignee)) in _IMPL_CONTRACT_ASSIGNEES
+    if not required:
         return
     if str(title or "").endswith(_IMPL_AUTO_ACTION_SUFFIX):
         return
@@ -467,8 +506,8 @@ def _validate_impl_contract(body, assignee, title=""):
     claims = [m.group(1).strip() for m in _IMPL_PATH_CLAIM_RE.finditer(text)]
     if not claims:
         raise CardContractError(
-            "建卡闸门拦下：assignee=engineer 的实现卡缺顶格「PATH-CLAIM: <path>[, <path>]」"
-            "（注意不能写成「- PATH-CLAIM: …」列表项）。")
+            "建卡闸门拦下：kind=implementation 的实现卡缺顶格"
+            "「PATH-CLAIM: <path>[, <path>]」（注意不能写成「- PATH-CLAIM: …」列表项）。")
     for claim in claims:
         for raw in claim.split(","):
             path = raw.strip()
@@ -488,11 +527,12 @@ def _validate_impl_contract(body, assignee, title=""):
         raw = _IMPL_TEST_PLAN_LINE_RE.search(text)
         actual = f"（当前是「TEST-PLAN: {raw.group(1)}」）" if raw else ""
         raise CardContractError(
-            "建卡闸门拦下：assignee=engineer 的实现卡缺顶格「TEST-PLAN: quick|full」"
+            "建卡闸门拦下：kind=implementation 的实现卡缺顶格「TEST-PLAN: quick|full」"
             "（只能写 quick 或 full）" + actual + "。")
     if _IMPL_CONSUMER_RE.search(text) is None:
         raise CardContractError(
-            "建卡闸门拦下：assignee=engineer 的实现卡缺顶格「CONSUMER: <下游会执行的命令>」。")
+            "建卡闸门拦下：kind=implementation 的实现卡缺顶格"
+            "「CONSUMER: <下游会执行的命令>」。")
 
 
 # QA 收口的 tier 前置：与 team-board evidence 契约同口径（kind=tier，
@@ -527,22 +567,20 @@ def _latest_event_payload(conn, task_id, kind):
 
 
 def _gate_qa_tier(conn, task_id, *, acting_profile=None):
-    """有 ``impl_done`` 的 QA-SPEC 卡，qa 收口前必须有合法的 pm tier 证据。
+    """kind=implementation 的 QA-SPEC 卡，qa 收口前必须有合法 pm tier 证据。
 
     只拦 qa 的收口路径：非 qa 的 complete 先由 ``_gate_qa_completion`` 处理，
     ``force=True`` 是那条闸门的显式逃逸口；本闸门不再二次改变 force 的语义。
 
-    **必须带 impl_done 才生效**：qa 的「签署验收标准」卡正文也含 ``QA-SPEC: qa``，
-    但它没有实现、也没有 tier；按 body 判会把签卡误拦（2026-11-07 端到端实测）。
-    实现卡在交 qa 前由 pre-review 闸门强制写过 impl_done，所以这条判据不会漏。
+    卡类型是唯一判据：QA 签卡/PM 需求卡即使引用 QA-SPEC 行也不是实现卡，
+    不会因为没有 tier 被误拦（2026-11-08 E2E 两次误拦的结构化修复）。
     """
-    profile, _run_id, body = _qa_completion_actor(conn, task_id, acting_profile)
+    profile, _run_id, body, kind = _qa_completion_actor(conn, task_id, acting_profile)
+    if kind != "implementation":
+        return
     if _QA_SPEC_SIGN_RE.search(body) is None:
         return
     if (profile or "") != "qa":
-        return
-    impl_payload, _impl_run_id = _latest_event_payload(conn, task_id, "impl_done")
-    if impl_payload is None:
         return
     payload, tier_run_id = _latest_event_payload(conn, task_id, "tier")
     if payload is None:
@@ -1026,6 +1064,8 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Structural card type; gates key on it instead of parsing the body.
+    kind: str = "requirement"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -1043,6 +1083,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            kind=g("kind") or "requirement",
         )
 
 
@@ -1241,6 +1282,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- Structural card type (VALID_TASK_KINDS): implementation / spec_sign /
+    -- requirement / merge / action. Kernel admission/completion gates key on
+    -- this column, not on prose parsed out of the body.
+    kind                 TEXT NOT NULL DEFAULT 'requirement',
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -1554,6 +1599,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1577,13 +1623,14 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    task_kind = _normalize_task_kind(kind, assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     _validate_task_body(body)
     _validate_pr_claim(title, body)
     _validate_merge_assignee(title, assignee)
-    _validate_qa_spec(body, assignee)
-    _validate_impl_contract(body, assignee, title)
+    _validate_qa_spec(body, assignee, kind=task_kind)
+    _validate_impl_contract(body, assignee, title, kind=task_kind)
     _validate_card_template(body)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
@@ -1628,14 +1675,14 @@ def create_task(
     # 同标题 + 同 parent 的实现卡仍未结时，拒绝再建一张「替代卡」：E1b
     # 实测过 PM 被 card-audit 拦下后新建重复卡，正确动作是改原卡（或先归档）。
     # 同位 parent 是必要条件：返工卡通常挂在被判卡下，不能被误判成重复。
-    if assignee == "engineer":
+    if task_kind == "implementation":
         cutoff = int(time.time()) - _DUP_TASK_WINDOW_SECONDS
         candidates = conn.execute(
             "SELECT id, status FROM tasks "
-            " WHERE assignee = ? AND title = ? "
+            " WHERE kind = 'implementation' AND title = ? "
             "   AND status NOT IN ('done', 'archived') AND created_at >= ? "
             " ORDER BY created_at DESC",
-            (assignee, title.strip(), cutoff),
+            (title.strip(), cutoff),
         ).fetchall()
         wanted_parents = set(parents)
         for dup in candidates:
@@ -1685,8 +1732,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1696,6 +1744,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        task_kind,
                     ),
                 )
                 for pid in parents:
@@ -1706,6 +1755,7 @@ def create_task(
                     "created",
                     {
                         "assignee": assignee,
+                        "kind": task_kind,
                         "status": task_status,
                         "parents": list(parents),
                         "creator_task_id": creator_task_id,
@@ -3050,17 +3100,18 @@ def _claim_is_live(trow) -> bool:
 
 def _qa_completion_actor(
     conn: sqlite3.Connection, task_id: str, acting_profile: Optional[str],
-) -> tuple[Optional[str], Optional[int], str]:
-    """``(profile, run_id, body)`` for the qa-signature completion gate.
+) -> tuple[Optional[str], Optional[int], str, str]:
+    """``(profile, run_id, body, kind)`` for the qa completion gates.
 
     ``acting_profile`` wins when the caller names it; otherwise the profile comes
     from ``tasks.current_run_id`` → ``task_runs.profile`` (no active run → None).
+    ``kind`` is the structural card type; gates key on it instead of prose.
     """
     row = conn.execute(
-        "SELECT body, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        "SELECT body, current_run_id, kind FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if row is None:
-        return acting_profile, None, ""
+        return acting_profile, None, "", "requirement"
     run_id = row["current_run_id"]
     profile = acting_profile
     if profile is None and run_id:
@@ -3068,7 +3119,7 @@ def _qa_completion_actor(
             "SELECT profile FROM task_runs WHERE id = ?", (run_id,),
         ).fetchone()
         profile = r["profile"] if r is not None else None
-    return profile, run_id, row["body"] or ""
+    return profile, run_id, row["body"] or "", (row["kind"] or "requirement")
 
 
 def _gate_qa_completion(
@@ -3081,20 +3132,13 @@ def _gate_qa_completion(
     the event log untouched. ``force=True`` is the only escape hatch and it is
     never silent — it records a ``qa_completion_override`` audit event.
     """
-    profile, run_id, body = _qa_completion_actor(conn, task_id, acting_profile)
+    profile, run_id, body, kind = _qa_completion_actor(conn, task_id, acting_profile)
+    # 卡类型是唯一判据：需求卡/QA 签卡即使正文引用 QA-SPEC 行也不是实现卡。
+    if kind != "implementation":
+        return
     if _QA_SPEC_SIGN_RE.search(body) is None:
         return
     if (profile or "") == "qa":
-        return
-    # 需求卡/QA 签卡也可能引用 QA-SPEC 行，但它们没有实现；只有实现卡
-    # （有 impl_done，或原始 assignee 仍是 engineer）才需要 qa 收口。
-    # 否则 pm 的需求卡会被误判成实现卡（2026-11-07 端到端实测）。
-    assignee_row = conn.execute(
-        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    assignee = assignee_row["assignee"] if assignee_row is not None else None
-    impl_payload, _impl_run_id = _latest_event_payload(conn, task_id, "impl_done")
-    if impl_payload is None and (assignee or "") != "engineer":
         return
     if not force:
         raise QaCompletionError(

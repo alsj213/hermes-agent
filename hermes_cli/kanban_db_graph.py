@@ -182,7 +182,7 @@ def _insert_decomposed_child(
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event, _validate_qa_spec,
-        _validate_impl_contract,
+        _validate_impl_contract, _normalize_task_kind,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -198,27 +198,30 @@ def _insert_decomposed_child(
     new_id = _new_task_id()
     body = child.get("body")
     child_assignee = _canonical_assignee(child.get("assignee"))
+    child_kind = _normalize_task_kind(child.get("kind"), child_assignee)
     # 建卡闸门（验收标准段 + qa 签署行）：本函数是全仓第二处 ``INSERT INTO
     # tasks``（另一处是 ``create_task``），写库时同样记一条 ``created`` 事件 ——
     # 它就是「建卡」，所以同一道闸门在这里也要过，否则 decompose 能造出
     # 正是闸门要拦的 engineer 卡。抛在 ``decompose_triage_task`` 的 write_txn
     # 内 = 整批 fan-out 回滚（root 不翻状态、无子卡、无事件）。
-    _validate_qa_spec(body if isinstance(body, str) else None, child_assignee)
+    _validate_qa_spec(body if isinstance(body, str) else None, child_assignee, kind=child_kind)
     _validate_impl_contract(
-        body if isinstance(body, str) else None, child_assignee, child.get("title") or "")
+        body if isinstance(body, str) else None, child_assignee,
+        child.get("title") or "", kind=child_kind)
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, kind) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             child_assignee, child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), child_kind,
         ),
     )
     _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
+        conn, new_id, "created",
+        {"by": author or "decomposer", "kind": child_kind, "from_decompose_of": root_id},
     )
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id

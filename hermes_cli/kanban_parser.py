@@ -165,6 +165,9 @@ _SPECS = [
                   "newlines or flag-like lines survive shell quoting. "
                   "Mutually exclusive with --body."),
         _arg("--assignee", help="Profile name to assign"),
+        _arg("--kind", choices=list(kb.VALID_TASK_KINDS),
+             help="Structural card type (default: inferred from assignee: "
+                  "engineer→implementation, qa→spec_sign, repo→merge, else requirement)."),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
         _arg("--workspace",
              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
